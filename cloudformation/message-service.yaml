@@ -1,0 +1,222 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  iOS engineer homework message service (in-memory Lambda behind a REST API
+  Gateway). Create it for a hiring cycle and delete it afterward. Every
+  create/recreate yields a NEW execute-api hostname, so update README.md
+  with the MessagesUrl output each time.
+
+Parameters:
+  StageName:
+    Type: String
+    Default: proto
+    AllowedPattern: "^[A-Za-z0-9_]+$"
+    Description: API Gateway stage name (path prefix in the invoke URL).
+  LogRetentionDays:
+    Type: Number
+    Default: 14
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90]
+    Description: CloudWatch Logs retention for the Lambda log group.
+
+Resources:
+  MessageFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+
+  MessageFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Description: iOS homework message service (messages are held in memory only)
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role: !GetAtt MessageFunctionRole.Arn
+      MemorySize: 128
+      Timeout: 10
+      Code:
+        ZipFile: |
+          # Prototype-quality homework API, ported unchanged in behavior from
+          # the 2020 console-created message_service Lambda. Messages live
+          # only in this execution environment's memory and vanish when it
+          # is recycled.
+          import json
+          import logging
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          messages = {}
+
+
+          def lambda_handler(event, context):
+              body = ''
+              statusCode = 200
+
+              logger.info("event: %s", event)
+              op = event['operation']
+
+              if op == 'add_message':
+                  user = event['user']
+                  message = event['message']
+                  subject = event['subject']
+                  body = {'user': user, 'subject': subject, 'message': message}
+                  messages.setdefault(user, []).append({'subject': subject, 'message': message})
+
+              elif op == 'list':
+                  filter = event['filter']
+                  if filter == 'user':
+                      user = event['user']
+                      if user in messages:
+                          body = {'user': user, 'message': messages[user]}
+                      else:
+                          statusCode = 404
+                          body = 'resource not found'
+                  elif filter == 'all':
+                      body = messages
+                  else:
+                      statusCode = 400
+                      body = 'invalid filter'
+              else:
+                  statusCode = 400
+                  body = 'invalid event format'
+
+              return {'statusCode': statusCode, 'body': json.dumps(body)}
+
+  MessageFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${MessageFunction}
+      RetentionInDays: !Ref LogRetentionDays
+
+  MessageApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub ${AWS::StackName}-api
+      Description: iOS homework message service API
+      EndpointConfiguration:
+        Types: [REGIONAL]
+
+  MessagesResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref MessageApi
+      ParentId: !GetAtt MessageApi.RootResourceId
+      PathPart: messages
+
+  UserResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref MessageApi
+      ParentId: !Ref MessagesResource
+      PathPart: "{user}"
+
+  # Non-proxy (AWS) integrations keep the original contract: the request body
+  # is the Lambda event, and the Lambda's {"statusCode", "body"} return value
+  # is the HTTP 200 response body.
+  PostMessagesMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref MessageApi
+      ResourceId: !Ref MessagesResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS
+        IntegrationHttpMethod: POST
+        Uri: !Sub arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${MessageFunction.Arn}/invocations
+        PassthroughBehavior: WHEN_NO_TEMPLATES
+        IntegrationResponses:
+          - StatusCode: "200"
+      MethodResponses:
+        - StatusCode: "200"
+          ResponseModels:
+            application/json: Empty
+
+  GetMessagesMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref MessageApi
+      ResourceId: !Ref MessagesResource
+      HttpMethod: GET
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS
+        IntegrationHttpMethod: POST
+        Uri: !Sub arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${MessageFunction.Arn}/invocations
+        PassthroughBehavior: NEVER
+        RequestTemplates:
+          application/json: '{"operation": "list", "filter": "all"}'
+        IntegrationResponses:
+          - StatusCode: "200"
+      MethodResponses:
+        - StatusCode: "200"
+          ResponseModels:
+            application/json: Empty
+
+  GetUserMessagesMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref MessageApi
+      ResourceId: !Ref UserResource
+      HttpMethod: GET
+      AuthorizationType: NONE
+      RequestParameters:
+        method.request.path.user: true
+      Integration:
+        Type: AWS
+        IntegrationHttpMethod: POST
+        Uri: !Sub arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${MessageFunction.Arn}/invocations
+        PassthroughBehavior: NEVER
+        RequestTemplates:
+          application/json: >-
+            {"operation": "list", "filter": "user", "user": "$util.escapeJavaScript($input.params('user'))"}
+        IntegrationResponses:
+          - StatusCode: "200"
+      MethodResponses:
+        - StatusCode: "200"
+          ResponseModels:
+            application/json: Empty
+
+  ApiInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref MessageFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${MessageApi}/*/*/*
+
+  ApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - PostMessagesMethod
+      - GetMessagesMethod
+      - GetUserMessagesMethod
+      - MessageFunctionLogGroup
+    Properties:
+      RestApiId: !Ref MessageApi
+      Description: Homework API deployment
+
+  ApiStage:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      RestApiId: !Ref MessageApi
+      DeploymentId: !Ref ApiDeployment
+      StageName: !Ref StageName
+
+Outputs:
+  ApiBaseUrl:
+    Description: Invoke base URL (changes on every stack create/recreate).
+    Value: !Sub https://${MessageApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}/${ApiStage}
+  MessagesUrl:
+    Description: Paste this into README.md as the homework API URL.
+    Value: !Sub https://${MessageApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}/${ApiStage}/messages
+  FunctionName:
+    Description: Lambda function name (for logs and debugging).
+    Value: !Ref MessageFunction
