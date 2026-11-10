@@ -42,33 +42,52 @@ Resources:
       Timeout: 10
       Code:
         ZipFile: |
-          # Prototype-quality homework API. Messages live only in this
-          # execution environment's memory and vanish when it is recycled.
+          # Prototype-quality homework API, ported unchanged in behavior from
+          # the 2020 console-created message_service Lambda. Messages live
+          # only in this execution environment's memory and vanish when it
+          # is recycled.
           import json
+          import logging
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
 
           messages = {}
 
 
           def lambda_handler(event, context):
+              body = ''
+              statusCode = 200
+
+              logger.info("event: %s", event)
               op = event['operation']
 
               if op == 'add_message':
-                  entry = {'subject': event['subject'], 'message': event['message']}
-                  messages.setdefault(event['user'], []).append(entry)
-                  return {'statusCode': 200, 'body': json.dumps(entry)}
+                  user = event['user']
+                  message = event['message']
+                  subject = event['subject']
+                  body = {'user': user, 'subject': subject, 'message': message}
+                  messages.setdefault(user, []).append({'subject': subject, 'message': message})
 
-              if op == 'list':
-                  user = event.get('user')
-                  if not user:
-                      return {'statusCode': 200, 'body': json.dumps(messages)}
-                  if user not in messages:
-                      return {'statusCode': 404, 'body': json.dumps('resource not found')}
-                  return {
-                      'statusCode': 200,
-                      'body': json.dumps({'user': user, 'message': messages[user]}),
-                  }
+              elif op == 'list':
+                  filter = event['filter']
+                  if filter == 'user':
+                      user = event['user']
+                      if user in messages:
+                          body = {'user': user, 'message': messages[user]}
+                      else:
+                          statusCode = 404
+                          body = 'resource not found'
+                  elif filter == 'all':
+                      body = messages
+                  else:
+                      statusCode = 400
+                      body = 'invalid filter'
+              else:
+                  statusCode = 400
+                  body = 'invalid event format'
 
-              return {'statusCode': 400, 'body': json.dumps('unsupported operation')}
+              return {'statusCode': statusCode, 'body': json.dumps(body)}
 
   MessageFunctionLogGroup:
     Type: AWS::Logs::LogGroup
@@ -133,7 +152,7 @@ Resources:
         Uri: !Sub arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${MessageFunction.Arn}/invocations
         PassthroughBehavior: NEVER
         RequestTemplates:
-          application/json: '{"operation": "list"}'
+          application/json: '{"operation": "list", "filter": "all"}'
         IntegrationResponses:
           - StatusCode: "200"
       MethodResponses:
@@ -157,7 +176,7 @@ Resources:
         PassthroughBehavior: NEVER
         RequestTemplates:
           application/json: >-
-            {"operation": "list", "user": "$util.escapeJavaScript($input.params('user'))"}
+            {"operation": "list", "filter": "user", "user": "$util.escapeJavaScript($input.params('user'))"}
         IntegrationResponses:
           - StatusCode: "200"
       MethodResponses:
